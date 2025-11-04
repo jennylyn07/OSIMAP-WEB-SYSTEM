@@ -468,7 +468,9 @@ export default function MapView() {
 
     let accidents = accidentData.features.filter(f =>
       f.properties && f.geometry && f.geometry.coordinates &&
-      f.properties.type !== "cluster_center"
+      f.properties.type !== "cluster_center" &&
+      f.properties.type !== "cluster_hull" &&
+      f.geometry.type === "Point"  // Only include Point geometries, not Polygon
     );
     let clusters = accidentData.features.filter(f =>
       f.properties && f.properties.type === "cluster_center"

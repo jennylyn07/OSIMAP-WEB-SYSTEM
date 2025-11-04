@@ -8,6 +8,7 @@ from sklearn.cluster import DBSCAN
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
+from scipy.spatial import ConvexHull
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*force_all_finite.*")
@@ -23,6 +24,7 @@ class AccidentClusterAnalyzer:
         self.df = None
         self.clustered_df = None
         self.cluster_centers = None
+        self.cluster_hulls = None
         self.temporal_weights = None
         self.trend_scores = None
         self.current_date = datetime.now()
@@ -257,6 +259,88 @@ class AccidentClusterAnalyzer:
         return labels
 
     # ======================================================
+    # NOISE REASSIGNMENT (NEAREST CLUSTER WITHIN RADIUS)
+    # ======================================================
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2):
+        """Calculate haversine distance between two points in kilometers"""
+        R = 6371.0088  # Earth radius in km
+        dlat = np.radians(lat2 - lat1)
+        dlon = np.radians(lon2 - lon1)
+        a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2) ** 2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        return R * c
+
+    def reassign_nearby_noise_to_clusters(self, max_radius_km=0.5):
+        """
+        Assign noise points to nearest cluster center if within max_radius_km.
+        This helps include border points that are visually inside clusters but
+        were marked as noise due to density-based clustering constraints.
+        """
+        if self.clustered_df is None:
+            return
+        
+        # Calculate cluster centers from current clustered points (ignore noise)
+        centers = []
+        for cid in sorted([c for c in self.clustered_df["cluster"].unique() if c != -1]):
+            subset = self.clustered_df[self.clustered_df["cluster"] == cid]
+            if len(subset) == 0:
+                continue
+            centers.append({
+                'cluster_id': cid,
+                'lat': subset["latitude"].mean(),
+                'lon': subset["longitude"].mean(),
+                'count': len(subset)
+            })
+        
+        if not centers:
+            print("  No clusters found for noise reassignment")
+            return
+        
+        # Get all noise points
+        noise_mask = self.clustered_df["cluster"] == -1
+        noise_indices = self.clustered_df[noise_mask].index
+        
+        if len(noise_indices) == 0:
+            print("  No noise points to reassign")
+            return
+        
+        print(f"\n Reassigning noise points within {max_radius_km} km of cluster centers...")
+        print(f"  Found {len(noise_indices)} noise points and {len(centers)} clusters")
+        
+        reassigned = 0
+        reassigned_by_cluster = {}
+        
+        for idx in noise_indices:
+            lat = self.clustered_df.at[idx, "latitude"]
+            lon = self.clustered_df.at[idx, "longitude"]
+            
+            # Find nearest cluster center
+            best_cluster_id = None
+            best_distance = float("inf")
+            
+            for center in centers:
+                distance = self._haversine_km(lat, lon, center['lat'], center['lon'])
+                if distance < best_distance:
+                    best_distance = distance
+                    best_cluster_id = center['cluster_id']
+            
+            # Reassign if within radius
+            if best_distance <= max_radius_km:
+                self.clustered_df.at[idx, "cluster"] = best_cluster_id
+                reassigned += 1
+                reassigned_by_cluster[best_cluster_id] = reassigned_by_cluster.get(best_cluster_id, 0) + 1
+        
+        if reassigned > 0:
+            print(f"  ✓ Reassigned {reassigned} noise points ({reassigned/len(noise_indices)*100:.1f}% of noise)")
+            print(f"  Remaining noise: {len(noise_indices) - reassigned}")
+            if reassigned_by_cluster:
+                top_clusters = sorted(reassigned_by_cluster.items(), key=lambda x: x[1], reverse=True)[:5]
+                print(f"  Top clusters receiving reassignments: {dict(top_clusters)}")
+        else:
+            print(f"  No noise points were within {max_radius_km} km of any cluster center")
+
+    # ======================================================
     # SPREAD CALC
     # ======================================================
     def cluster_spatial_spread(self, cluster_points):
@@ -365,12 +449,50 @@ class AccidentClusterAnalyzer:
     def calculate_cluster_centers(self):
         """Calculate cluster centers with enhanced danger scoring"""
         stats = []
+        hulls = []
+        
+        # helper for haversine distance (km)
+        def haversine_km(lat1, lon1, lat2, lon2):
+            R = 6371.0088
+            dlat = np.radians(lat2 - lat1)
+            dlon = np.radians(lon2 - lon1)
+            a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2) ** 2
+            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            return R * c
+        
         for cid in self.clustered_df["cluster"].unique():
             if cid == -1:
                 continue
                 
             subset = self.clustered_df[self.clustered_df["cluster"] == cid]
             danger_score = self.calculate_danger_score(subset)
+            
+            # display center: choose member closest to mean (robust medoid-like)
+            mean_lat = subset["latitude"].mean()
+            mean_lon = subset["longitude"].mean()
+            dists = ((subset["latitude"] - mean_lat) ** 2 + (subset["longitude"] - mean_lon) ** 2)
+            center_idx = dists.idxmin()
+            disp_lat = float(self.clustered_df.at[center_idx, "latitude"])
+            disp_lon = float(self.clustered_df.at[center_idx, "longitude"])
+            
+            # p95 radius in meters from display center
+            distances_km = subset.apply(lambda r: haversine_km(disp_lat, disp_lon, r["latitude"], r["longitude"]), axis=1).values
+            radius_p95_m = float(np.percentile(distances_km, 95) * 1000.0) if len(distances_km) > 0 else 0.0
+            
+            # convex hull (lon,lat order for GeoJSON)
+            try:
+                pts = subset[["longitude", "latitude"]].to_numpy()
+                if len(pts) >= 3:
+                    hull = ConvexHull(pts)
+                    hull_coords = [(float(pts[i][0]), float(pts[i][1])) for i in hull.vertices]
+                    # close polygon ring
+                    if hull_coords and hull_coords[0] != hull_coords[-1]:
+                        hull_coords.append(hull_coords[0])
+                else:
+                    # Fallback: small circle-like hull using min bounding points
+                    hull_coords = [(float(x), float(y)) for x, y in pts]
+            except Exception:
+                hull_coords = []
             
             # Calculate recent accidents (last 12 months)
             recent_cutoff = self.current_date - timedelta(days=365)
@@ -385,12 +507,21 @@ class AccidentClusterAnalyzer:
                 "recent_accidents": recent_accidents,
                 "avg_temporal_weight": round(subset['temporal_weight'].mean(), 4),
                 "avg_trend_score": round(subset['trend_score'].mean(), 4),
-                "barangays": subset["barangay"].dropna().unique().tolist() if "barangay" in subset.columns else []
+                "barangays": subset["barangay"].dropna().unique().tolist() if "barangay" in subset.columns else [],
+                # display helpers for UI
+                "display_center_lat": disp_lat,
+                "display_center_lon": disp_lon,
+                "display_radius_m": round(radius_p95_m, 2)
+            })
+            hulls.append({
+                "cluster_id": int(cid),
+                "coordinates": hull_coords  # list of (lon, lat)
             })
             
         # Sort by danger score (most dangerous first)
         stats = sorted(stats, key=lambda x: x["danger_score"], reverse=True)
         self.cluster_centers = stats
+        self.cluster_hulls = hulls
 
     def get_alert_worthy_clusters(self, threshold_percentile=20):
         """Get clusters that should trigger mobile app alerts"""
@@ -514,6 +645,23 @@ class AccidentClusterAnalyzer:
                     "properties": cluster_properties
                 })
         
+        # Add cluster hull polygons with type="cluster_hull"
+        if self.cluster_hulls:
+            for hull in self.cluster_hulls:
+                coords = hull.get("coordinates") or []
+                if len(coords) >= 3:
+                    # Convert tuples (lon, lat) to lists [lon, lat] for GeoJSON
+                    # Polygon coordinates must be: [[[lon, lat], [lon, lat], ...]]
+                    polygon_coords = [[[float(coord[0]), float(coord[1])] for coord in coords]]
+                    geojson["features"].append({
+                        "type": "Feature",
+                        "geometry": {"type": "Polygon", "coordinates": polygon_coords},
+                        "properties": {
+                            "type": "cluster_hull",
+                            "cluster_id": hull["cluster_id"]
+                        }
+                    })
+        
         with open(output, "w", encoding="utf-8") as f:
             json.dump(geojson, f, indent=2, ensure_ascii=False)
         print(f" Exported combined GeoJSON to {output}")
@@ -566,7 +714,10 @@ class AccidentClusterAnalyzer:
         # Use temporal sub-clustering instead of the old method
         self.temporal_subcluster_large_clusters()
         
-        # Calculate enhanced cluster stats
+        # Reassign nearby noise points to nearest clusters (fixes border points marked as noise)
+        self.reassign_nearby_noise_to_clusters(max_radius_km=0.5)
+        
+        # Calculate enhanced cluster stats (after reassignment)
         self.calculate_cluster_centers()
         self.get_cluster_summary()
         
