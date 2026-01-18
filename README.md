@@ -70,9 +70,9 @@ This section has moved here: [https://facebook.github.io/create-react-app/docs/d
 This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
 
 
-Documentation
+Project Details
 
-# OSIMAP: Crime Mapping & Analytics
+# OSIMAP: Accident Mapping & Analytics
 
 A full‑stack platform for visualizing and analyzing crime data. It combines an authenticated, map‑first UI with background analytics and exportable insights for reporting and decision support.
 
